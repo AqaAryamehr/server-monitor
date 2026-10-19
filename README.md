@@ -21,7 +21,7 @@ dashboard** (like a tiny Netdata).
 Run on the server that will host the panel (as root, or with `sudo`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/AqaAryamehr/server-monitor/main/install.sh | sudo bash
 ```
 
 The script asks you to choose the **port** of the panel, then a **username** and a **password**, and prints the panel link, for example
@@ -30,7 +30,7 @@ The script asks you to choose the **port** of the panel, then a **username** and
 Prefer to look at the code first?
 
 ```bash
-curl -fsSL -o server_monitor.py https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/server_monitor.py
+curl -fsSL -o server_monitor.py https://raw.githubusercontent.com/AqaAryamejr/server-monitor/main/server_monitor.py
 python3 server_monitor.py
 ```
 
@@ -67,7 +67,7 @@ sudo server-monitor update
 ```
 
 - The main panel downloads the newest `server_monitor.py` from the address it was installed from (the installer
-  remembers it; to set or change it: `server-monitor update --url https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/server_monitor.py`).
+  remembers it; to set or change it: `server-monitor update --url https://raw.githubusercontent.com/AqaAryamehr/server-monitor/main/server_monitor.py`).
 - A node downloads the version of its main panel, so all servers always run the same version.
 - The new file is checked before it replaces the old one, the old one is kept as `server_monitor.py.bak`,
   the service restarts automatically, and if the new version does not start the previous one is restored.
