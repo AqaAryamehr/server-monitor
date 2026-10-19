@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Server Monitor - one-line installer
-#   curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/AqaAryamehr/server-monitor/main/install.sh | sudo bash
 # Extra arguments are passed to server_monitor.py, e.g.:  ... | sudo bash -s -- --port 9090
 set -euo pipefail
 
-RAW_URL="${SM_RAW_URL:-https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main}"
+RAW_URL="${SM_RAW_URL:-https://raw.githubusercontent.com/AqaAryamehr/server-monitor/main}"
 INSTALL_DIR="${SM_DIR:-/opt/server-monitor}"
 
 if [ "$(id -u)" -ne 0 ]; then
