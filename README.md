@@ -30,7 +30,7 @@ The script asks you to choose the **port** of the panel, then a **username** and
 Prefer to look at the code first?
 
 ```bash
-curl -fsSL -o server_monitor.py https://raw.githubusercontent.com/AqaAryamejr/server-monitor/main/server_monitor.py
+curl -fsSL -o server_monitor.py https://raw.githubusercontent.com/AqaAryamehr/server-monitor/main/server_monitor.py
 python3 server_monitor.py
 ```
 
@@ -48,15 +48,24 @@ If the node cannot reach the panel for a while, it keeps its data and sends it w
 Remove a server from the same Settings window. Manual alternative:
 `python3 server_monitor.py --node http://PANEL:8080 --token TOKEN`.
 
-## Telegram alerts
+## Telegram bot and alerts
 
 1. In Telegram open **@BotFather**, send `/newbot` and copy the **bot token**.
 2. Open your new bot and press **Start**, then get your **chat ID** (for example from **@userinfobot**).
-3. Panel -> **Settings** -> **Telegram alerts**: enter token and chat ID, choose the limit, press **Save**, then **Send test message**.
+3. Panel -> **Settings** -> **Telegram bot and alerts**: enter token and chat ID, choose the limit, tick the alert box,
+   press **Save**, then **Send test message**.
 
-CPU and RAM alert after staying above the limit for a minute, disk alerts at once. You get a message when it recovers,
-and a reminder every 30 minutes while it stays high. If the server cannot reach `api.telegram.org`, use
-*Advanced* to set an HTTP proxy or another API address.
+**Bot menu:** as soon as the token and chat ID are saved, send `/start` to your bot. It lists all servers of the panel
+(with a green/red dot and their CPU, RAM and disk). Tap a server to get its live status (CPU, RAM, disk, traffic in/out,
+load, uptime), then **Refresh** or go **back to the list**. Only your chat can use the bot; everybody else gets
+"This bot is private".
+
+**Alerts:** CPU, RAM and disk of every server are checked every second. The moment one reaches the limit (default 80 %)
+you get a message with the value and the time, and a **Details** button that shows the live status. It is not repeated
+while the value stays high (a reminder follows after 30 minutes). When the value has been clearly below the limit for
+30 seconds you get a "back to normal" message. If Telegram cannot be reached the alert is retried for about two minutes.
+
+If the server cannot reach `api.telegram.org`, use *Advanced* to set an HTTP proxy or another API address.
 
 ## Update
 

@@ -18,6 +18,7 @@ import collections
 import getpass
 import gzip
 import hashlib
+import html as _html
 import hmac
 import http.client
 import http.cookies
@@ -41,7 +42,7 @@ from array import array
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 LAUNCHER = "/usr/local/bin/server-monitor"  # the `server-monitor update|uninstall|status|restart` command
 UNIT_DIR = "/etc/systemd/system"
 UNITS = ("server-monitor", "server-monitor-node")  # panel service, node service
@@ -546,7 +547,7 @@ def public_settings():
         token = tg.pop("token")
         tg["token_set"] = bool(token)
         tg["token_hint"] = "…" + token[-4:] if token else ""
-        return {"local_name": SETTINGS["local_name"], "telegram": tg, "tg_status": dict(TG_STATUS)}
+        return {"local_name": SETTINGS["local_name"], "telegram": tg, "tg_status": dict(TG_STATUS), "bot": dict(BOT_STATUS)}
 
 
 def update_settings(data):
@@ -600,50 +601,116 @@ def update_settings(data):
     return ""
 
 
-def send_telegram(text):
-    """Send a message through the configured bot. Returns (ok, message) and remembers the result."""
-    with SETTINGS_LOCK:
-        tg = dict(SETTINGS["telegram"])
-    if not tg["token"] or not tg["chat_id"]:
-        ok, msg = False, "Bot token and chat ID are not set."
-    else:
-        url = f"{tg['api_base']}/bot{tg['token']}/sendMessage"
-        req = urllib.request.Request(url, json.dumps({"chat_id": tg["chat_id"], "text": text}).encode(),
-                                     {"Content-Type": "application/json"})
-        opener = urllib.request.build_opener(*([urllib.request.ProxyHandler({"http": tg["proxy"], "https": tg["proxy"]})]
-                                               if tg["proxy"] else []))
-        try:
-            with opener.open(req, timeout=10) as r:
-                body = json.loads(r.read().decode() or "{}")
-            ok = bool(body.get("ok"))
-            msg = "Message sent." if ok else str(body.get("description", "Unknown Telegram error"))
-        except urllib.error.HTTPError as e:
-            try:
-                desc = json.loads(e.read().decode()).get("description", "")
-            except Exception:
-                desc = ""
-            ok, msg = False, f"Telegram answered {e.code}: {desc or e.reason}"
-        except Exception as e:
-            ok = False
-            msg = (f"Cannot reach Telegram ({str(e).replace(tg['token'], '***')}). If this server cannot open "
-                   "api.telegram.org, set an HTTP proxy or a custom API base URL under Advanced.")
-    TG_STATUS.update(ok=ok, msg=msg, time=int(time.time() * 1000))
-    return ok, msg
-
-
 def _gb(b):
     return f"{b / 1073741824:.1f} GB"
 
 
+class TgError(Exception):
+    def __init__(self, msg, retry=False, wait=0):
+        super().__init__(msg)
+        self.retry, self.wait = retry, wait
+
+
+def tg_api(method, payload=None, timeout=15):
+    """Call one Telegram Bot API method with the saved token/proxy/address. Returns the result or raises TgError."""
+    with SETTINGS_LOCK:
+        tg = dict(SETTINGS["telegram"])
+    if not tg["token"]:
+        raise TgError("Bot token is not set.")
+    req = urllib.request.Request(f"{tg['api_base']}/bot{tg['token']}/{method}", json.dumps(payload or {}).encode(),
+                                 {"Content-Type": "application/json"})
+    opener = urllib.request.build_opener(*([urllib.request.ProxyHandler({"http": tg["proxy"], "https": tg["proxy"]})]
+                                           if tg["proxy"] else []))
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            body = json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            d = json.loads(e.read().decode())
+        except Exception:
+            d = {}
+        raise TgError(f"Telegram answered {e.code}: {d.get('description') or e.reason}",
+                      retry=(e.code == 429 or e.code >= 500), wait=(d.get("parameters") or {}).get("retry_after", 0))
+    except Exception as e:
+        raise TgError(f"Cannot reach Telegram ({str(e).replace(tg['token'], '***')}). If this server cannot open "
+                      "api.telegram.org, set an HTTP proxy or a custom API base URL under Advanced.", retry=True)
+    if not body.get("ok"):
+        raise TgError(str(body.get("description", "Unknown Telegram error")))
+    return body.get("result")
+
+
+def _chat_id():
+    with SETTINGS_LOCK:
+        return SETTINGS["telegram"]["chat_id"]
+
+
+def send_telegram(text, markup=None):
+    """One attempt to send a message to the admin chat. Returns (ok, message) and remembers the result."""
+    try:
+        payload = {"chat_id": _chat_id(), "text": text, "parse_mode": "HTML"}
+        if markup:
+            payload["reply_markup"] = markup
+        tg_api("sendMessage", payload)
+        ok, msg = True, "Message sent."
+    except TgError as e:
+        ok, msg = False, str(e)
+    TG_STATUS.update(ok=ok, msg=msg, time=int(time.time() * 1000))
+    return ok, msg
+
+
+RETRY_DELAYS = (2, 5, 15, 30, 60)  # an alert is retried for about two minutes if Telegram cannot be reached
+
+
+def deliver(text, markup=None):
+    """Send an alert and keep trying (network errors, Telegram overload) so that it is not lost."""
+    for i in range(len(RETRY_DELAYS) + 1):
+        try:
+            payload = {"chat_id": _chat_id(), "text": text, "parse_mode": "HTML"}
+            if markup:
+                payload["reply_markup"] = markup
+            tg_api("sendMessage", payload)
+            TG_STATUS.update(ok=True, msg="Message sent.", time=int(time.time() * 1000))
+            return True
+        except TgError as e:
+            TG_STATUS.update(ok=False, msg=str(e), time=int(time.time() * 1000))
+            if not e.retry or i == len(RETRY_DELAYS):
+                return False
+            time.sleep(max(RETRY_DELAYS[i], e.wait))
+    return False
+
+
+def fmt_size(b):
+    u = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    while b >= 1024 and i < len(u) - 1:
+        b /= 1024
+        i += 1
+    return f"{b:.{2 if i > 2 else 0}f} {u[i]}"
+
+
+def fmt_rate(bps):
+    v, u, i = bps * 8, ["bit/s", "Kbit/s", "Mbit/s", "Gbit/s", "Tbit/s"], 0
+    while v >= 1000 and i < len(u) - 1:
+        v /= 1000
+        i += 1
+    return f"{v:.0f} {u[i]}" if i == 0 else f"{v:.1f} {u[i]}" if v >= 100 else f"{v:.2f} {u[i]}"
+
+
+def _clock(ms):
+    return time.strftime("%H:%M:%S", time.localtime(ms / 1000))
+
+
 class Alerts:
-    """Telegram alerts for one server: CPU/RAM must stay above the limit for a minute, disk is checked at once."""
+    """Telegram alerts for one server. Checked every second: the first second CPU, RAM or disk is at or above the
+    limit an alert is sent at once. It is not repeated while the value stays high (a reminder follows after 30 minutes);
+    when the value has been clearly below the limit for 30 seconds a 'back to normal' message is sent."""
     LABEL = {"cpu": "CPU", "ram": "RAM", "disk": "Disk"}
-    SUSTAIN = {"cpu": 60, "ram": 60, "disk": 0}  # seconds above the limit before alerting
-    COOLDOWN = 1800                              # repeat a still-active alert every 30 minutes
+    COOLDOWN = 1800      # reminder while a value stays high
+    RECOVER_AFTER = 30   # seconds clearly below the limit before 'back to normal'
 
     def __init__(self, src):
         self.src = src
-        self.st = {m: {"since": None, "active": False, "sent": 0.0} for m in self.LABEL}
+        self.st = {m: {"active": False, "sent": 0.0, "ok_since": None} for m in self.LABEL}
 
     def _values(self, s):
         mem, d = s["mem"], s.get("disk") or {}
@@ -657,31 +724,159 @@ class Alerts:
             return f"Used {_gb(d.get('used', 0))} of {_gb(d.get('total', 0))}"
         return f"Load average {s['load'][0]:.2f}"
 
-    def feed(self, s):
+    def feed(self, s, now=None):
         with SETTINGS_LOCK:
             tg = SETTINGS["telegram"]
             enabled, limit = bool(tg["enabled"] and tg["token"] and tg["chat_id"]), tg["threshold"]
         if not enabled:
             return
-        now = time.time()
+        now = time.time() if now is None else now
+        margin = min(5, limit * 0.1)
+        name = _html.escape(self.src.name)
         for m, v in self._values(s).items():
             st = self.st[m]
             if v >= limit:
-                if st["since"] is None:
-                    st["since"] = now
-                if now - st["since"] >= self.SUSTAIN[m] and (not st["active"] or now - st["sent"] >= self.COOLDOWN):
+                st["ok_since"] = None
+                if not st["active"] or now - st["sent"] >= self.COOLDOWN:
+                    again = st["active"]
                     st["active"], st["sent"] = True, now
-                    self._send(f"\u26a0\ufe0f {self.src.name}: high {self.LABEL[m]} usage\n"
-                               f"{self.LABEL[m]}: {v:.1f}% (limit {limit}%)\n{self._detail(m, s)}")
-            else:
-                st["since"] = None
-                if st["active"] and v < limit - 5:
-                    st["active"] = False
-                    self._send(f"\u2705 {self.src.name}: {self.LABEL[m]} is back to normal ({v:.1f}%)")
+                    self._send(f"\U0001f6a8 <b>{name}</b>: {self.LABEL[m]} {'is still high' if again else 'is high'}\n"
+                               f"<b>{self.LABEL[m]}: {v:.1f}%</b>  (limit {limit}%)\n{self._detail(m, s)}\n"
+                               f"\U0001f552 {_clock(s['t'])}")
+            elif st["active"]:
+                if v < limit - margin:
+                    if st["ok_since"] is None:
+                        st["ok_since"] = now
+                    if now - st["ok_since"] >= self.RECOVER_AFTER:
+                        st["active"], st["ok_since"] = False, None
+                        self._send(f"\u2705 <b>{name}</b>: {self.LABEL[m]} is back to normal ({v:.1f}%)\n\U0001f552 {_clock(s['t'])}")
+                else:
+                    st["ok_since"] = None
 
-    @staticmethod
-    def _send(text):
-        threading.Thread(target=send_telegram, args=(text,), daemon=True).start()
+    def _send(self, text):
+        markup = {"inline_keyboard": [[{"text": "\U0001f4ca Details", "callback_data": "snap:" + self.src.id}]]}
+        threading.Thread(target=deliver, args=(text, markup), daemon=True).start()
+
+
+# ---------------------------------------------------------------- Telegram bot menu (/start -> servers -> live details)
+BOT_STATUS = {"ok": None, "msg": "", "time": 0}
+
+
+def snapshot_text(src):
+    info = src.info()
+    with src.lock:
+        s = src.history[-1] if src.history else None
+    name = _html.escape(info["name"])
+    if not s:
+        return f"\U0001f534 <b>{name}</b>\nNo data yet."
+    mem, d = s["mem"], s.get("disk") or {}
+    rx = sum(v[0] for n, v in s["net"].items() if n != "lo")
+    tx = sum(v[1] for n, v in s["net"].items() if n != "lo")
+    up = s.get("uptime", 0)
+    state = "\U0001f7e2 online" if info["online"] else "\U0001f534 offline (last data " + _clock(s["t"]) + ")"
+    rows = [f"CPU   {s['cpu']:5.1f} %   {info.get('cores') or len(s['cores']) or '?'} cores, load {s['load'][0]:.2f}",
+            f"RAM   {_pct(mem['used'], mem['total']):5.1f} %   {fmt_size(mem['used'])} / {fmt_size(mem['total'])}",
+            f"Disk  {_pct(d.get('used', 0), d.get('total', 0)):5.1f} %   {fmt_size(d.get('used', 0))} / {fmt_size(d.get('total', 0))}",
+            f"In    {fmt_rate(rx)}", f"Out   {fmt_rate(tx)}",
+            f"Up    {up // 86400}d {up % 86400 // 3600}h {up % 3600 // 60}m"]
+    return (f"<b>{name}</b>  {state}\n\U0001f552 {_clock(s['t'])}\n<pre>" + _html.escape("\n".join(rows)) + "</pre>")
+
+
+def bot_list_view():
+    servers = server_list()
+    lines, buttons = ["<b>Your servers</b> - tap one for its live status:\n"], []
+    for x in servers:
+        dot = "\U0001f7e2" if x["online"] else "\U0001f534"
+        extra = f" \u00b7 CPU {x['cpu']:.0f}% \u00b7 RAM {x['ram']:.0f}% \u00b7 Disk {x['disk']:.0f}%" if x["online"] and "cpu" in x else " \u00b7 offline"
+        lines.append(f"{dot} {_html.escape(x['name'])}{extra}")
+        buttons.append([{"text": f"{dot} {x['name']}", "callback_data": "srv:" + x["id"]}])
+    buttons.append([{"text": "\U0001f504 Refresh list", "callback_data": "list"}])
+    return "\n".join(lines), {"inline_keyboard": buttons}
+
+
+def bot_server_view(sid):
+    with SOURCES_LOCK:
+        src = SOURCES.get(sid)
+    if not src:
+        return "That server was removed.", {"inline_keyboard": [[{"text": "\u2b05\ufe0f Servers", "callback_data": "list"}]]}
+    return snapshot_text(src), {"inline_keyboard": [[{"text": "\U0001f504 Refresh", "callback_data": "srv:" + sid},
+                                                     {"text": "\u2b05\ufe0f Servers", "callback_data": "list"}]]}
+
+
+def _edit(chat, mid, text, markup):
+    try:
+        tg_api("editMessageText", {"chat_id": chat, "message_id": mid, "text": text, "parse_mode": "HTML", "reply_markup": markup})
+    except TgError as e:
+        if "not modified" not in str(e):
+            raise
+
+
+def bot_handle(u):
+    admin = _chat_id()
+    cb, msg = u.get("callback_query"), u.get("message")
+    if cb:
+        m = cb.get("message") or {}
+        chat = (m.get("chat") or {}).get("id")
+        if str(chat) != admin:
+            tg_api("answerCallbackQuery", {"callback_query_id": cb["id"], "text": "Not allowed.", "show_alert": True})
+            return
+        tg_api("answerCallbackQuery", {"callback_query_id": cb["id"]})
+        data = cb.get("data") or ""
+        if data == "list":
+            _edit(chat, m["message_id"], *bot_list_view())
+        elif data.startswith("srv:"):
+            _edit(chat, m["message_id"], *bot_server_view(data[4:]))
+        elif data.startswith("snap:"):  # from an alert: keep the alert, send the details as a new message
+            text, markup = bot_server_view(data[5:])
+            tg_api("sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML", "reply_markup": markup})
+    elif msg and isinstance(msg.get("text"), str) and msg["text"].startswith("/"):
+        chat = (msg.get("chat") or {}).get("id")
+        if str(chat) != admin:
+            tg_api("sendMessage", {"chat_id": chat, "text": "This bot is private."})
+            return
+        if msg["text"].split()[0].split("@")[0].lower() in ("/start", "/servers", "/menu", "/help", "/status"):
+            text, markup = bot_list_view()
+            tg_api("sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML", "reply_markup": markup})
+
+
+def bot_loop():
+    offset, ready, backoff = 0, None, 1
+    while True:
+        with SETTINGS_LOCK:
+            tg = dict(SETTINGS["telegram"])
+        if not (tg["token"] and tg["chat_id"]):
+            BOT_STATUS.update(ok=None, msg="Save the bot token and chat ID to turn the bot menu on.")
+            time.sleep(3)
+            continue
+        key = (tg["token"], tg["api_base"], tg["proxy"])
+        try:
+            if ready != key:
+                me = tg_api("getMe")
+                try:
+                    tg_api("deleteWebhook")
+                except TgError:
+                    pass
+                tg_api("setMyCommands", {"commands": [{"command": "start", "description": "Show my servers"},
+                                                      {"command": "servers", "description": "Show my servers"}]})
+                ready, offset, backoff = key, 0, 1
+                BOT_STATUS.update(ok=True, msg=f"Bot menu is on: send /start to @{me.get('username', 'your bot')}", time=int(time.time() * 1000))
+            for u in tg_api("getUpdates", {"offset": offset, "timeout": 25, "allowed_updates": ["message", "callback_query"]}, timeout=40) or []:
+                offset = u["update_id"] + 1
+                try:
+                    bot_handle(u)
+                except Exception as e:
+                    print(f"bot error: {e}", file=sys.stderr)
+            backoff = 1
+        except TgError as e:
+            ready = None
+            BOT_STATUS.update(ok=False, msg=f"Bot menu is off: {e}", time=int(time.time() * 1000))
+            time.sleep(min(backoff, 30))
+            backoff *= 2
+        except Exception as e:
+            ready = None
+            BOT_STATUS.update(ok=False, msg=f"Bot menu is off: {e}", time=int(time.time() * 1000))
+            time.sleep(min(backoff, 30))
+            backoff *= 2
 
 
 # ---------------------------------------------------------------- nodes (other servers reporting to this panel)
@@ -1217,7 +1412,7 @@ class Handler(BaseHTTPRequestHandler):
                 err = "Bad request"
             self._json(400 if err else 200, {"error": err} if err else public_settings())
         elif path == "/api/telegram/test":
-            ok, msg = send_telegram(f"\u2705 Test message from Server Monitor ({local_name()}). Alerts are working.")
+            ok, msg = send_telegram(f"\u2705 Test message from Server Monitor ({_html.escape(local_name())}). Alerts are working.\nSend /start to this bot to see your servers.")
             self._json(200, {"ok": ok, "msg": msg})
         elif path == "/api/nodes":
             try:
@@ -1511,8 +1706,8 @@ label.f{display:block;font-size:13px;color:var(--muted);margin:2px 0 4px}
     <label class="f" for="localName">Display name</label>
     <input type="text" id="localName" maxlength="40" placeholder="Name shown in the server list">
 
-    <h3>Telegram alerts</h3>
-    <label class="chk"><input type="checkbox" id="tgOn"><span>Send a Telegram message when CPU, RAM or disk usage of any server reaches the limit</span></label>
+    <h3>Telegram bot and alerts</h3>
+    <label class="chk"><input type="checkbox" id="tgOn"><span>Send an alert the moment CPU, RAM or disk usage of any server reaches the limit (checked every second)</span></label>
     <input type="password" id="tgToken" autocomplete="off" placeholder="Bot token (from @BotFather)">
     <input type="text" id="tgChat" autocomplete="off" placeholder="Your chat ID">
     <label class="f" for="tgLimit">Limit (%)</label>
@@ -1525,6 +1720,8 @@ label.f{display:block;font-size:13px;color:var(--muted);margin:2px 0 4px}
     </details>
     <div class="row"><button class="btn pri" id="tgSave">Save</button><button class="btn" id="tgTest">Send test message</button></div>
     <p class="note" id="tgMsg"></p>
+    <p class="note" id="botMsg"></p>
+    <p class="note">The bot menu works as soon as the token and chat ID are saved: open your bot in Telegram and send /start to see your servers.</p>
   </div>
 </div>
 
@@ -1929,6 +2126,7 @@ async function loadSettings(){
   $('tgBase').value = t.api_base || '';
   const st = s.tg_status;
   say('tgMsg', st && st.msg ? `Last Telegram result: ${st.msg}` : '', st && st.ok === false ? 'err' : (st && st.ok ? 'ok' : ''));
+  const bt = s.bot; say('botMsg', bt && bt.msg ? bt.msg : '', bt && bt.ok === false ? 'err' : (bt && bt.ok ? 'ok' : ''));
   renderNodeList(list);
 }
 let nodeToken = '';
@@ -2435,6 +2633,7 @@ def main():
         SOURCES[LOCAL_ID] = local
     load_nodes()
     threading.Thread(target=local_sampler, args=(local,), daemon=True).start()
+    threading.Thread(target=bot_loop, daemon=True).start()
     try:
         srv = ThreadingHTTPServer((ARGS.host, ARGS.port), Handler)
     except OSError as e:
