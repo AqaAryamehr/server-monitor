@@ -65,6 +65,11 @@ you get a message with the value and the time, and a **Details** button that sho
 while the value stays high (a reminder follows after 30 minutes). When the value has been clearly below the limit for
 30 seconds you get a "back to normal" message. If Telegram cannot be reached the alert is retried for about two minutes.
 
+**Offline alerts:** if a server connected as a node stops sending data for 15 seconds you get a "server is offline" message
+(with the time of its last data and a **Details** button), a reminder every 30 minutes while it stays offline, and a
+"back online" message with the downtime when it returns. A node that has not reconnected 60 seconds after the panel started is
+reported too. The checkbox *Also alert when a server goes offline* in Settings turns this on or off.
+
 If the server cannot reach `api.telegram.org`, use *Advanced* to set an HTTP proxy or another API address.
 
 ## Update

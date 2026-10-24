@@ -42,7 +42,7 @@ from array import array
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 LAUNCHER = "/usr/local/bin/server-monitor"  # the `server-monitor update|uninstall|status|restart` command
 UNIT_DIR = "/etc/systemd/system"
 UNITS = ("server-monitor", "server-monitor-node")  # panel service, node service
@@ -523,7 +523,7 @@ class Source:
 
 
 # ---------------------------------------------------------------- settings and Telegram alerts
-DEFAULT_TG = {"enabled": False, "token": "", "chat_id": "", "threshold": 80, "proxy": "",
+DEFAULT_TG = {"enabled": False, "offline": True, "token": "", "chat_id": "", "threshold": 80, "proxy": "",
               "api_base": "https://api.telegram.org"}
 SETTINGS = {"local_name": "", "telegram": dict(DEFAULT_TG)}
 TG_STATUS = {"ok": None, "msg": "", "time": 0}
@@ -563,6 +563,8 @@ def update_settings(data):
             g = new["telegram"]
             if "enabled" in t:
                 g["enabled"] = bool(t["enabled"])
+            if "offline" in t:
+                g["offline"] = bool(t["offline"])
             if t.get("token"):
                 tok = str(t["token"]).strip()
                 if not re.fullmatch(r"\d{5,15}:[A-Za-z0-9_-]{20,80}", tok):
@@ -754,8 +756,74 @@ class Alerts:
                     st["ok_since"] = None
 
     def _send(self, text):
-        markup = {"inline_keyboard": [[{"text": "\U0001f4ca Details", "callback_data": "snap:" + self.src.id}]]}
-        threading.Thread(target=deliver, args=(text, markup), daemon=True).start()
+        send_alert(text, self.src.id)
+
+
+# ---------------------------------------------------------------- offline alerts (a server stops reporting)
+OFFLINE_AFTER = 15   # seconds without data before a server counts as offline
+OFFLINE_GRACE = 60   # a server that has not reported since the panel (re)started gets this long to reconnect
+OFFLINE_REMIND = 1800
+
+
+def send_alert(text, sid):
+    """Send an alert message with a Details button for that server (in the background, with retries)."""
+    markup = {"inline_keyboard": [[{"text": "\U0001f4ca Details", "callback_data": "snap:" + sid}]]}
+    threading.Thread(target=deliver, args=(text, markup), daemon=True).start()
+
+
+def fmt_dur(sec):
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m {sec % 60}s"
+    if sec < 86400:
+        return f"{sec // 3600}h {sec % 3600 // 60}m"
+    return f"{sec // 86400}d {sec % 86400 // 3600}h"
+
+
+def offline_check(state, started, now):
+    """One pass over all nodes: alert when one went silent, when it stays offline, and when it is back."""
+    with SETTINGS_LOCK:
+        tg = SETTINGS["telegram"]
+        on = bool(tg["enabled"] and tg["token"] and tg["chat_id"] and tg.get("offline", True))
+    with SOURCES_LOCK:
+        nodes = [x for x in SOURCES.values() if not x.local]
+    for src in nodes:
+        st = state.setdefault(src.id, {"alerted": False, "since": 0.0, "sent": 0.0})
+        ref, limit = (src.last_rx, OFFLINE_AFTER) if src.last_rx else (started, OFFLINE_GRACE)
+        name = _html.escape(src.name)
+        if now - ref >= limit:  # offline
+            if not on:
+                continue
+            with src.lock:
+                last = src.history[-1] if src.history else None
+            if not st["alerted"]:
+                st.update(alerted=True, since=ref, sent=now)
+                detail = (f"Last data {_clock(last['t'])}: CPU {last['cpu']:.0f}% \u00b7 RAM "
+                          f"{_pct(last['mem']['used'], last['mem']['total']):.0f}%") if last else "It has not reported since the panel started."
+                send_alert(f"\U0001f534 <b>{name}</b> is offline\nNo data for {fmt_dur(now - ref)}.\n{detail}\n"
+                           f"\U0001f552 {time.strftime('%H:%M:%S', time.localtime(now))}", src.id)
+            elif now - st["sent"] >= OFFLINE_REMIND:
+                st["sent"] = now
+                send_alert(f"\U0001f534 <b>{name}</b> is still offline (for {fmt_dur(now - st['since'])})", src.id)
+        elif st["alerted"]:  # data is flowing again
+            st["alerted"] = False
+            if on:
+                send_alert(f"\U0001f7e2 <b>{name}</b> is back online (was offline for {fmt_dur(now - st['since'])})\n"
+                           f"\U0001f552 {time.strftime('%H:%M:%S', time.localtime(now))}", src.id)
+    for sid in [k for k in state if k not in {x.id for x in nodes}]:  # removed servers
+        del state[sid]
+
+
+def offline_watch():
+    state, started = {}, time.time()
+    while True:
+        time.sleep(1)
+        try:
+            offline_check(state, started, time.time())
+        except Exception as e:
+            print(f"offline watch error: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------- Telegram bot menu (/start -> servers -> live details)
@@ -1708,6 +1776,7 @@ label.f{display:block;font-size:13px;color:var(--muted);margin:2px 0 4px}
 
     <h3>Telegram bot and alerts</h3>
     <label class="chk"><input type="checkbox" id="tgOn"><span>Send an alert the moment CPU, RAM or disk usage of any server reaches the limit (checked every second)</span></label>
+    <label class="chk"><input type="checkbox" id="tgOff"><span>Also alert when a server goes offline, and when it is back online</span></label>
     <input type="password" id="tgToken" autocomplete="off" placeholder="Bot token (from @BotFather)">
     <input type="text" id="tgChat" autocomplete="off" placeholder="Your chat ID">
     <label class="f" for="tgLimit">Limit (%)</label>
@@ -2120,7 +2189,7 @@ async function loadSettings(){
   const [s, list] = await Promise.all([getJSON('api/settings'), getJSON('api/servers')]);
   const t = s.telegram;
   $('localName').value = s.local_name || '';
-  $('tgOn').checked = !!t.enabled; $('tgToken').value = '';
+  $('tgOn').checked = !!t.enabled; $('tgOff').checked = t.offline !== false; $('tgToken').value = '';
   $('tgToken').placeholder = t.token_set ? `Saved (${t.token_hint}) - leave empty to keep it` : 'Bot token (from @BotFather)';
   $('tgChat').value = t.chat_id || ''; $('tgLimit').value = t.threshold; $('tgProxy').value = t.proxy || '';
   $('tgBase').value = t.api_base || '';
@@ -2143,7 +2212,7 @@ async function openSettings(focusAdd){
 }
 const closeSettings = () => { $('modal').hidden = true; };
 function tgBody(){
-  const t = {enabled: $('tgOn').checked, chat_id: $('tgChat').value, threshold: $('tgLimit').value, proxy: $('tgProxy').value, api_base: $('tgBase').value};
+  const t = {enabled: $('tgOn').checked, offline: $('tgOff').checked, chat_id: $('tgChat').value, threshold: $('tgLimit').value, proxy: $('tgProxy').value, api_base: $('tgBase').value};
   if ($('tgToken').value) t.token = $('tgToken').value;
   return {local_name: $('localName').value, telegram: t};
 }
@@ -2634,6 +2703,7 @@ def main():
     load_nodes()
     threading.Thread(target=local_sampler, args=(local,), daemon=True).start()
     threading.Thread(target=bot_loop, daemon=True).start()
+    threading.Thread(target=offline_watch, daemon=True).start()
     try:
         srv = ThreadingHTTPServer((ARGS.host, ARGS.port), Handler)
     except OSError as e:
