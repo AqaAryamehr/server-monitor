@@ -42,7 +42,7 @@ from array import array
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 LAUNCHER = "/usr/local/bin/server-monitor"  # the `server-monitor update|uninstall|status|restart` command
 UNIT_DIR = "/etc/systemd/system"
 UNITS = ("server-monitor", "server-monitor-node")  # panel service, node service
@@ -114,11 +114,39 @@ def read_disk(path="/"):
     return {"total": used + st.f_bavail * st.f_frsize, "used": used}
 
 
+_EST = re.compile(rb" [0-9A-Fa-f]{8,32}:[0-9A-Fa-f]{4} 01 ")  # a socket in state ESTABLISHED (01) in /proc/net/{tcp,udp}[6]
+
+
+def count_established(*paths):
+    n = 0
+    for p in paths:
+        try:
+            with open(p, "rb") as f:
+                n += len(_EST.findall(f.read()))
+        except OSError:
+            pass
+    return n
+
+
+def read_conns():
+    """Established TCP connections and connected UDP sockets of this server (like `ss -Htan state established` / `ss -Hun`)."""
+    return {"tcp": count_established("/proc/net/tcp", "/proc/net/tcp6"), "udp": count_established("/proc/net/udp", "/proc/net/udp6")}
+
+
 class Collector:
     """Produces one sample per call; rates are computed from the previous call."""
 
     def __init__(self):
         self.prev_cpu, self.prev_net, self.prev_t = read_cpu(), read_net(), time.time()
+        self.conns, self.conn_next = {"tcp": 0, "udp": 0}, 0.0
+
+    def _conns(self, now):
+        """Counted every few seconds (a busy server can have tens of thousands of sockets); the interval grows with the cost."""
+        if now >= self.conn_next:
+            t0 = time.time()
+            self.conns = read_conns()
+            self.conn_next = now + min(60.0, max(5.0, (time.time() - t0) * 100))
+        return self.conns
 
     def wait(self):
         time.sleep(max(0.05, 1 - (time.time() - self.prev_t) % 1))
@@ -152,6 +180,7 @@ class Collector:
             "load": list(os.getloadavg()),
             "uptime": int(uptime),
             "disk": read_disk(),
+            "conns": dict(self._conns(now)),
         }
 
 
@@ -607,6 +636,11 @@ def _gb(b):
     return f"{b / 1073741824:.1f} GB"
 
 
+def _esc(text):
+    """Escape text for Telegram's HTML mode (only & < > must be escaped)."""
+    return _html.escape(str(text), quote=False)
+
+
 class TgError(Exception):
     def __init__(self, msg, retry=False, wait=0):
         super().__init__(msg)
@@ -619,11 +653,11 @@ def tg_api(method, payload=None, timeout=15):
         tg = dict(SETTINGS["telegram"])
     if not tg["token"]:
         raise TgError("Bot token is not set.")
-    req = urllib.request.Request(f"{tg['api_base']}/bot{tg['token']}/{method}", json.dumps(payload or {}).encode(),
-                                 {"Content-Type": "application/json"})
-    opener = urllib.request.build_opener(*([urllib.request.ProxyHandler({"http": tg["proxy"], "https": tg["proxy"]})]
-                                           if tg["proxy"] else []))
     try:
+        req = urllib.request.Request(f"{tg['api_base']}/bot{tg['token']}/{method}", json.dumps(payload or {}).encode(),
+                                     {"Content-Type": "application/json"})
+        opener = urllib.request.build_opener(*([urllib.request.ProxyHandler({"http": tg["proxy"], "https": tg["proxy"]})]
+                                               if tg["proxy"] else []))
         with opener.open(req, timeout=timeout) as r:
             body = json.loads(r.read().decode() or "{}")
     except urllib.error.HTTPError as e:
@@ -631,7 +665,15 @@ def tg_api(method, payload=None, timeout=15):
             d = json.loads(e.read().decode())
         except Exception:
             d = {}
-        raise TgError(f"Telegram answered {e.code}: {d.get('description') or e.reason}",
+        desc = str(d.get("description") or e.reason)
+        hint = ""
+        if e.code == 401:
+            hint = " The bot token is wrong or was revoked: create a new one in @BotFather."
+        elif e.code == 403:
+            hint = " Open your bot in Telegram and press Start (or unblock it): a bot cannot message you first."
+        elif e.code == 400 and "chat not found" in desc.lower():
+            hint = " Check the chat ID, and press Start in your bot first."
+        raise TgError(f"Telegram answered {e.code}: {desc}.{hint}".replace(". .", "."),
                       retry=(e.code == 429 or e.code >= 500), wait=(d.get("parameters") or {}).get("retry_after", 0))
     except Exception as e:
         raise TgError(f"Cannot reach Telegram ({str(e).replace(tg['token'], '***')}). If this server cannot open "
@@ -641,21 +683,38 @@ def tg_api(method, payload=None, timeout=15):
     return body.get("result")
 
 
+def tg_html(method, payload):
+    """Send formatted text; if Telegram rejects the formatting, send the same message as plain text instead."""
+    try:
+        return tg_api(method, dict(payload, parse_mode="HTML"))
+    except TgError as e:
+        if "parse entities" not in str(e).lower():
+            raise
+        plain = dict(payload, text=_html.unescape(re.sub(r"<[^>]+>", "", payload["text"])))
+        return tg_api(method, plain)
+
+
 def _chat_id():
     with SETTINGS_LOCK:
         return SETTINGS["telegram"]["chat_id"]
 
 
+def _message(text, markup):
+    payload = {"chat_id": _chat_id(), "text": text}
+    if markup:
+        payload["reply_markup"] = markup
+    return payload
+
+
 def send_telegram(text, markup=None):
     """One attempt to send a message to the admin chat. Returns (ok, message) and remembers the result."""
     try:
-        payload = {"chat_id": _chat_id(), "text": text, "parse_mode": "HTML"}
-        if markup:
-            payload["reply_markup"] = markup
-        tg_api("sendMessage", payload)
+        tg_html("sendMessage", _message(text, markup))
         ok, msg = True, "Message sent."
     except TgError as e:
         ok, msg = False, str(e)
+    except Exception as e:
+        ok, msg = False, f"Unexpected error: {e}"
     TG_STATUS.update(ok=ok, msg=msg, time=int(time.time() * 1000))
     return ok, msg
 
@@ -667,17 +726,19 @@ def deliver(text, markup=None):
     """Send an alert and keep trying (network errors, Telegram overload) so that it is not lost."""
     for i in range(len(RETRY_DELAYS) + 1):
         try:
-            payload = {"chat_id": _chat_id(), "text": text, "parse_mode": "HTML"}
-            if markup:
-                payload["reply_markup"] = markup
-            tg_api("sendMessage", payload)
+            tg_html("sendMessage", _message(text, markup))
             TG_STATUS.update(ok=True, msg="Message sent.", time=int(time.time() * 1000))
             return True
         except TgError as e:
             TG_STATUS.update(ok=False, msg=str(e), time=int(time.time() * 1000))
             if not e.retry or i == len(RETRY_DELAYS):
+                print(f"Telegram alert could not be sent: {e}", file=sys.stderr, flush=True)
                 return False
             time.sleep(max(RETRY_DELAYS[i], e.wait))
+        except Exception as e:
+            TG_STATUS.update(ok=False, msg=f"Unexpected error: {e}", time=int(time.time() * 1000))
+            print(f"Telegram alert could not be sent: {e}", file=sys.stderr, flush=True)
+            return False
     return False
 
 
@@ -734,7 +795,7 @@ class Alerts:
             return
         now = time.time() if now is None else now
         margin = min(5, limit * 0.1)
-        name = _html.escape(self.src.name)
+        name = _esc(self.src.name)
         for m, v in self._values(s).items():
             st = self.st[m]
             if v >= limit:
@@ -792,7 +853,7 @@ def offline_check(state, started, now):
     for src in nodes:
         st = state.setdefault(src.id, {"alerted": False, "since": 0.0, "sent": 0.0})
         ref, limit = (src.last_rx, OFFLINE_AFTER) if src.last_rx else (started, OFFLINE_GRACE)
-        name = _html.escape(src.name)
+        name = _esc(src.name)
         if now - ref >= limit:  # offline
             if not on:
                 continue
@@ -834,7 +895,7 @@ def snapshot_text(src):
     info = src.info()
     with src.lock:
         s = src.history[-1] if src.history else None
-    name = _html.escape(info["name"])
+    name = _esc(info["name"])
     if not s:
         return f"\U0001f534 <b>{name}</b>\nNo data yet."
     mem, d = s["mem"], s.get("disk") or {}
@@ -846,8 +907,9 @@ def snapshot_text(src):
             f"RAM   {_pct(mem['used'], mem['total']):5.1f} %   {fmt_size(mem['used'])} / {fmt_size(mem['total'])}",
             f"Disk  {_pct(d.get('used', 0), d.get('total', 0)):5.1f} %   {fmt_size(d.get('used', 0))} / {fmt_size(d.get('total', 0))}",
             f"In    {fmt_rate(rx)}", f"Out   {fmt_rate(tx)}",
+            *([f"Conn  TCP {s['conns']['tcp']:,} \u00b7 UDP {s['conns']['udp']:,}"] if s.get("conns") else []),
             f"Up    {up // 86400}d {up % 86400 // 3600}h {up % 3600 // 60}m"]
-    return (f"<b>{name}</b>  {state}\n\U0001f552 {_clock(s['t'])}\n<pre>" + _html.escape("\n".join(rows)) + "</pre>")
+    return (f"<b>{name}</b>  {state}\n\U0001f552 {_clock(s['t'])}\n<pre>" + _esc("\n".join(rows)) + "</pre>")
 
 
 def bot_list_view():
@@ -856,7 +918,7 @@ def bot_list_view():
     for x in servers:
         dot = "\U0001f7e2" if x["online"] else "\U0001f534"
         extra = f" \u00b7 CPU {x['cpu']:.0f}% \u00b7 RAM {x['ram']:.0f}% \u00b7 Disk {x['disk']:.0f}%" if x["online"] and "cpu" in x else " \u00b7 offline"
-        lines.append(f"{dot} {_html.escape(x['name'])}{extra}")
+        lines.append(f"{dot} {_esc(x['name'])}{extra}")
         buttons.append([{"text": f"{dot} {x['name']}", "callback_data": "srv:" + x["id"]}])
     buttons.append([{"text": "\U0001f504 Refresh list", "callback_data": "list"}])
     return "\n".join(lines), {"inline_keyboard": buttons}
@@ -873,10 +935,18 @@ def bot_server_view(sid):
 
 def _edit(chat, mid, text, markup):
     try:
-        tg_api("editMessageText", {"chat_id": chat, "message_id": mid, "text": text, "parse_mode": "HTML", "reply_markup": markup})
+        tg_html("editMessageText", {"chat_id": chat, "message_id": mid, "text": text, "reply_markup": markup})
     except TgError as e:
         if "not modified" not in str(e):
             raise
+
+
+def _answer(cb_id, **kw):
+    """Stop the spinner on a pressed button; an old or already answered press is not an error worth stopping for."""
+    try:
+        tg_api("answerCallbackQuery", dict({"callback_query_id": cb_id}, **kw))
+    except TgError:
+        pass
 
 
 def bot_handle(u):
@@ -886,9 +956,9 @@ def bot_handle(u):
         m = cb.get("message") or {}
         chat = (m.get("chat") or {}).get("id")
         if str(chat) != admin:
-            tg_api("answerCallbackQuery", {"callback_query_id": cb["id"], "text": "Not allowed.", "show_alert": True})
+            _answer(cb["id"], text="Not allowed.", show_alert=True)
             return
-        tg_api("answerCallbackQuery", {"callback_query_id": cb["id"]})
+        _answer(cb["id"])
         data = cb.get("data") or ""
         if data == "list":
             _edit(chat, m["message_id"], *bot_list_view())
@@ -896,7 +966,7 @@ def bot_handle(u):
             _edit(chat, m["message_id"], *bot_server_view(data[4:]))
         elif data.startswith("snap:"):  # from an alert: keep the alert, send the details as a new message
             text, markup = bot_server_view(data[5:])
-            tg_api("sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML", "reply_markup": markup})
+            tg_html("sendMessage", {"chat_id": chat, "text": text, "reply_markup": markup})
     elif msg and isinstance(msg.get("text"), str) and msg["text"].startswith("/"):
         chat = (msg.get("chat") or {}).get("id")
         if str(chat) != admin:
@@ -904,7 +974,7 @@ def bot_handle(u):
             return
         if msg["text"].split()[0].split("@")[0].lower() in ("/start", "/servers", "/menu", "/help", "/status"):
             text, markup = bot_list_view()
-            tg_api("sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML", "reply_markup": markup})
+            tg_html("sendMessage", {"chat_id": chat, "text": text, "reply_markup": markup})
 
 
 def bot_loop():
@@ -1026,7 +1096,8 @@ def clean_sample(d):
     return {"t": int(d["t"]), "cpu": float(d["cpu"]), "cores": [float(x) for x in d.get("cores", [])][:512],
             "mem": {k: int(mem.get(k, 0)) for k in ("total", "used", "swap_total", "swap_used")},
             "net": net, "load": load, "uptime": int(d.get("uptime", 0)),
-            "disk": {"total": int(dk.get("total", 0)), "used": int(dk.get("used", 0))}}
+            "disk": {"total": int(dk.get("total", 0)), "used": int(dk.get("used", 0))},
+            "conns": {"tcp": int((d.get("conns") or {}).get("tcp", 0)), "udp": int((d.get("conns") or {}).get("udp", 0))} if d.get("conns") else None}
 
 
 NODE_INSTALLER = r"""#!/usr/bin/env bash
@@ -1480,7 +1551,7 @@ class Handler(BaseHTTPRequestHandler):
                 err = "Bad request"
             self._json(400 if err else 200, {"error": err} if err else public_settings())
         elif path == "/api/telegram/test":
-            ok, msg = send_telegram(f"\u2705 Test message from Server Monitor ({_html.escape(local_name())}). Alerts are working.\nSend /start to this bot to see your servers.")
+            ok, msg = send_telegram(f"\u2705 Test message from Server Monitor ({_esc(local_name())}). Alerts are working.\nSend /start to this bot to see your servers.")
             self._json(200, {"ok": ok, "msg": msg})
         elif path == "/api/nodes":
             try:
@@ -1749,7 +1820,7 @@ label.f{display:block;font-size:13px;color:var(--muted);margin:2px 0 4px}
   </section>
   <section class="panel"><div class="ph"><h2>Disk usage</h2><div class="chips"><span><i style="background:var(--disk)"></i><b id="lgDisk">-</b></span></div></div><div class="cw"><canvas id="cDisk"></canvas></div></section>
   <section class="panel"><div class="ph"><h2>CPU cores</h2></div><div id="cores"></div></section>
-  <div class="foot"><span id="fLoad"></span><span id="fSwap"></span><span id="fUp"></span></div>
+  <div class="foot"><span id="fLoad"></span><span id="fSwap"></span><span id="fUp"></span><span id="fTcp" title="Established TCP connections (ss -Htan state established)"></span><span id="fUdp" title="Connected UDP sockets (ss -Hun)"></span></div>
 </main>
 
 <div class="modal" id="modal" hidden>
@@ -2047,6 +2118,8 @@ function render(){
   $('cores').innerHTML = live.cores.map((p, i) => `<div class="core">CPU${i} · ${p.toFixed(0)}%<div><i style="width:${p}%"></i></div></div>`).join('');
   $('fLoad').textContent = 'Load ' + live.load.map(x => x.toFixed(2)).join(' / ');
   $('fSwap').textContent = live.mem.swap_total ? `Swap ${fmtBytes(live.mem.swap_used)} / ${fmtBytes(live.mem.swap_total)}` : 'Swap off';
+  const cn = live.conns; $('fTcp').style.display = $('fUdp').style.display = cn ? '' : 'none';
+  if (cn){ $('fTcp').textContent = 'TCP ' + cn.tcp.toLocaleString('en-US'); $('fUdp').textContent = 'UDP ' + cn.udp.toLocaleString('en-US'); }
   const s = live.uptime; $('fUp').textContent = `Uptime ${Math.floor(s / 86400)}d ${Math.floor(s % 86400 / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
 }
 
